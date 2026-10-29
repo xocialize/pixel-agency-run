@@ -1,0 +1,73 @@
+# Pixel Agency Run
+
+The run workflow of a [Media Engine Specification (MES)](https://github.com/xocialize/media-engine-spec) client, as a
+Swift package: find an engine, choose an operation, set its controls from the engine's own descriptor, give inputs,
+run, and keep or save the results. Everything goes through the open MES SDKs.
+
+It was [Pixel Agency Lite](https://github.com/xocialize/pixel-agency-lite)'s (LITE-16, Lite v0.4.2). It moved here so
+that the apps built on it link a package rather than an app repo (Gaea decision G-20, AB-D-0182; work order
+AB-T-0360):
+
+| App | How it uses the workflow |
+|---|---|
+| [Pixel Agency Desktop](https://github.com/xocialize/pixel-agency-desktop) | Embeds the views in its own window, adds its built-in engine in process, and runs each run as a durable ticket. |
+| Gaea Lab | The MES reference client (Gaea G-14), built on it. |
+| Pixel Agency Lite | Where it started. Lite is deprecated once Gaea Lab has what is worth keeping. |
+
+## Install
+
+```swift
+.package(url: "https://github.com/xocialize/pixel-agency-run.git", from: "0.1.0"),
+// target dependencies:
+.product(name: "PixelAgencyRun", package: "pixel-agency-run"),
+.product(name: "PixelAgencyRunUI", package: "pixel-agency-run"),
+```
+
+macOS 26. It depends on media-engine-spec (MESClientKit, MESCore, MESFormsUI) and DesignScaffold. No MLX.
+
+## Contents
+
+| Product | What it is |
+|---|---|
+| `PixelAgencyRun` | **The model.** Engines: discovery over Bonjour (`_mes-engine._tcp`), pairing, credentials in the keychain (`EngineDirectory`, `KeychainCredentialStore`). A run: inputs, controls from the descriptor, progress, results and what happened (`RunWorkflow`, `RunSession`). The session list, the working folder (`WorkingFolder`) and masks. |
+| `PixelAgencyRunUI` | **The views**, on MESFormsUI and DesignScaffold. Engines, operations and this session's runs; the canvas (input, progress and previews, results with Save, Share, Use as Input); the controls from the descriptor, media slots and the mask brush with "select subject"; what happened; working-folder onboarding. |
+| `pa-run` | The same workflow without a window, for the MES client conformance suite. |
+
+## Embedding the run workflow
+
+Four hooks let an app embed the workflow without forking it:
+
+- **An engine inside the app.** `EngineDirectory.addLocal(_:)` lists an in-process engine (MESInProcess) first, and
+  connects to it without the network. Desktop's built-in engine is one.
+- **Runs executed elsewhere.** Set `RunWorkflow.executor` to a `RunExecutor` and each run it starts is handed to the
+  executor, which reports progress and results back through the session's `report` methods. The views show the run
+  as they show any other. Desktop's executor turns each run into a durable ticket that stores results in its library
+  before confirming them.
+- **The views in pieces.** `RunEngineList`, `RunOperationList`, `RunSessionList`, `RunWorkflowCanvas`,
+  `RunWorkflowInspector` and `runWorkflowPairing(_:)` let an app compose the workflow into its own window.
+  `RunWorkflowView` is one arrangement of them (Lite's window).
+- **An allow-list.** `EngineDirectory.admits` decides which engines the app may use. A refused engine leaves
+  `entries` for `refused`, and `connect` and pairing refuse it. The engine list says how many are hidden.
+
+`RunWorkflow.profiles` limits the operations offered to some MES profiles (nil offers all), and
+`RunWorkflow.useAsInput(_:)` also takes a plain `MediaItem`, so an app can put its own files into a run.
+
+Every exchange the workflow has with an engine, in order, with the code and the spec section for each, is in Lite's
+[HOW-LITE-TALKS-TO-ENGINES.md](https://github.com/xocialize/pixel-agency-lite/blob/main/docs/HOW-LITE-TALKS-TO-ENGINES.md).
+
+## Tests
+
+```bash
+swift build --product pa-run
+```
+
+```bash
+swift test
+```
+
+The tests run every Image operation end to end against the MES mock engine, with controls entirely from descriptors,
+and the client conformance suite through `pa-run`.
+
+## Licence
+
+Apache-2.0 ([LICENSE](LICENSE)).
