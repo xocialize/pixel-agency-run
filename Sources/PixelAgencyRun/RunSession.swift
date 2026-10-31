@@ -1,3 +1,4 @@
+import AVFoundation
 import Foundation
 import ImageIO
 import MESClientKit
@@ -14,18 +15,62 @@ public struct MediaItem: Identifiable, Sendable, Hashable {
     public var name: String
     public var width: Int?
     public var height: Int?
+    /// Audio facts (Audio §1.1): read from the file, or a result's own (Base §10.1).
+    public var durationSeconds: Double?
+    public var sampleRate: Int?
+    public var channels: Int?
 
+    /// Images are probed for their size and audio for its duration, rate and channels; nothing else is read.
     public init(file: URL, mediaType: String? = nil, name: String? = nil) {
         self.file = file
         self.mediaType = mediaType ?? MediaType.infer(file)
         self.name = name ?? file.lastPathComponent
-        if let source = CGImageSourceCreateWithURL(file as CFURL, nil),
+        if isAudio {
+            if let audio = try? AVAudioFile(forReading: file) {
+                let format = audio.fileFormat
+                sampleRate = Int(format.sampleRate)
+                channels = Int(format.channelCount)
+                durationSeconds = format.sampleRate > 0 ? Double(audio.length) / format.sampleRate : nil
+            }
+        } else if let source = CGImageSourceCreateWithURL(file as CFURL, nil),
            let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any] {
             let w = props[kCGImagePropertyPixelWidth] as? Int, h = props[kCGImagePropertyPixelHeight] as? Int
             let rotated = (props[kCGImagePropertyOrientation] as? Int ?? 1) >= 5
             width = rotated ? h : w
             height = rotated ? w : h
         }
+    }
+
+    /// An output as an input: its facts come from the engine (Base §10.1), so the file isn't probed.
+    public init(file: URL, output: Output, name: String) {
+        self.file = file
+        self.mediaType = output.mediaType
+        self.name = name
+        width = output.width
+        height = output.height
+        durationSeconds = output.durationSeconds
+        sampleRate = output.sampleRate
+        channels = output.channels
+    }
+
+    public var isAudio: Bool { mediaType.hasPrefix("audio/") }
+    /// The kind of input slot this item fills: `audio` for sound, `image` for everything else (masks are images).
+    public var kind: Kind { isAudio ? .audio : .image }
+}
+
+/// Audio facts for people: "0:03 · 24 kHz · mono".
+public enum AudioFacts {
+    public static func line(duration: Double?, sampleRate: Int?, channels: Int?) -> String? {
+        var parts: [String] = []
+        if let duration {
+            let s = Int(duration.rounded(.down))
+            parts.append(duration < 10 ? String(format: "%.1f s", duration) : String(format: "%d:%02d", s / 60, s % 60))
+        }
+        if let rate = sampleRate {
+            parts.append(rate % 1000 == 0 ? "\(rate / 1000) kHz" : String(format: "%.2f kHz", Double(rate) / 1000))
+        }
+        if let channels { parts.append(channels == 1 ? "mono" : channels == 2 ? "stereo" : "\(channels) channels") }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 }
 
@@ -41,6 +86,13 @@ public struct RunResult: Identifiable, Sendable, Hashable {
     public var provenance: Provenance? { job.result?.provenance }
     public var effective: [String: JSONValue] { job.result?.effective ?? [:] }
     public var isImage: Bool { output.kind == .image || output.kind == .mask }
+    public var isAudio: Bool { output.kind == .audio }
+    /// Data and text outputs (edit_speech's `transcript`, compose's `timestamps` and `score`), shown as text.
+    public var isText: Bool { output.kind == .data || output.kind == .text }
+    /// Duration, rate and channels, from the output's facts (Base §10.1).
+    public var audioFacts: String? {
+        AudioFacts.line(duration: output.durationSeconds, sampleRate: output.sampleRate, channels: output.channels)
+    }
 
     public static func == (a: RunResult, b: RunResult) -> Bool { a.id == b.id }
     public func hash(into hasher: inout Hasher) { hasher.combine(id) }
@@ -52,7 +104,55 @@ public struct RunResult: Identifiable, Sendable, Hashable {
     }
 
     /// Use this result as the next operation's input (LITE-12), without saving it.
-    public var asInput: MediaItem { MediaItem(file: file, mediaType: output.mediaType, name: "\(job.operation) result") }
+    public var asInput: MediaItem {
+        isAudio ? MediaItem(file: file, output: output, name: "\(job.operation) result")
+            : MediaItem(file: file, mediaType: output.mediaType, name: "\(job.operation) result")
+    }
+
+    /// A data output's value: inline in the result, else the collected file's JSON.
+    public var value: JSONValue? {
+        output.value ?? (try? MESJSON.decoder.decode(JSONValue.self, from: Data(contentsOf: file)))
+    }
+
+    /// The output as text for people. A transcript (`{text}`) is its text; timed lines (`{lines: [{text, start_s,
+    /// end_s}]}`) one per line with their times; a text output its contents; any other data its JSON.
+    public var text: String {
+        if output.kind == .text { return (try? String(contentsOf: file, encoding: .utf8)) ?? "" }
+        guard let value else { return "" }
+        if let text = value["text"]?.stringValue, value.objectValue?.count == 1 { return text }
+        if let lines = value["lines"]?.arrayValue, value.objectValue?.count == 1 {
+            return lines.map { line in
+                let at = [line["start_s"], line["end_s"]].compactMap { $0?.numberValue }.map { String(format: "%.1f", $0) }
+                return (at.isEmpty ? "" : "[\(at.joined(separator: "–")) s] ") + (line["text"]?.stringValue ?? FormSchema.display(line))
+            }.joined(separator: "\n")
+        }
+        return Self.json(value)
+    }
+
+    static func json(_ value: JSONValue) -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        return (try? String(decoding: encoder.encode(value), as: UTF8.self)) ?? ""
+    }
+}
+
+/// A streamed output while it arrives (Base §11): its format, how much has come, and how soon the first chunk did.
+public struct StreamedOutput: Sendable, Equatable {
+    public var output: String
+    /// The stream's format from the plan (§7.2).
+    public var format: StreamPlan?
+    public var chunks = 0
+    public var bytes = 0
+    /// From sending the request to the first chunk.
+    public var firstChunkAfter: TimeInterval?
+    /// The final chunk has arrived.
+    public var finished = false
+
+    /// Seconds of sound received.
+    public var seconds: Double {
+        guard let format, format.frameBytes > 0, format.sampleRate > 0 else { return 0 }
+        return Double(bytes / format.frameBytes) / Double(format.sampleRate)
+    }
 }
 
 /// Runs a session's job somewhere other than in the session itself. Pixel Agency Desktop runs each as a durable
@@ -104,10 +204,21 @@ public final class RunSession: Identifiable {
     /// The latest preview the engine sent while running (`job.preview`), as image bytes.
     public private(set) var preview: Data?
     public private(set) var results: [RunResult] = []
+    /// The output streaming while the job runs (Base §11), when the run asked for a stream.
+    public private(set) var streamed: StreamedOutput?
+    /// Called on each chunk of a streamed output as it arrives, in order (pa-run writes them; views use `chunks()`).
+    public var onChunk: (@MainActor (OutputChunk) -> Void)?
     public private(set) var startedAt: Date?
     public private(set) var finishedAt: Date?
+    /// When the request went to the engine (after the inputs were sent).
+    public private(set) var submittedAt: Date?
     let folder: URL
     private var task: Task<Void, Never>?
+    /// This run's chunks so far, for listeners that join late; dropped when the run ends.
+    private var received: [OutputChunk] = []
+    private var listeners: [UUID: AsyncStream<OutputChunk>.Continuation] = [:]
+    /// `cancel()` was called: chunks still in flight are dropped.
+    private var released = false
     /// Where the job runs; nil runs it here. Set before `start`.
     public weak var executor: (any RunExecutor)?
 
@@ -118,6 +229,15 @@ public final class RunSession: Identifiable {
         self.descriptor = descriptor
         self.form = OperationFormModel(descriptor: descriptor)
         self.folder = folder
+        // The `voice` widget picks from the engine's voice lists, with samples (Base §6.5).
+        form.voiceSource = VoiceSource(engine: engine)
+        streamByDefault()
+    }
+
+    /// Streaming is on by default where the model that will run offers it (§6.4 `supports.stream`): the chosen model,
+    /// or with none chosen the descriptor's default. Called again when the model changes.
+    public func streamByDefault() {
+        form.stream = !form.streamableOutputs.isEmpty && form.effectiveModel?.streams == true
     }
 
     /// Required inputs not yet given.
@@ -133,7 +253,17 @@ public final class RunSession: Identifiable {
             items.count == 1 ? .one(.upload("<\(items[0].name)>")) : .many(items.map { .upload("<\($0.name)>") })
         }
         for (name, value) in data { inputs[name] = .one(.data(value)) }
-        return form.request(media: inputs)
+        return request(media: inputs)
+    }
+
+    /// The form's request, with each stream asked for as `pcm_s16le` where its output offers it (§7.1).
+    func request(media: [String: RequestInput]) -> JobRequest {
+        var request = form.request(media: media)
+        request.stream = request.stream?.map { asked in
+            let offered = descriptor.outputs.first { $0.name == asked.output }?.stream?.encodings ?? []
+            return StreamRequest(output: asked.output, encoding: offered.contains(.pcmS16LE) ? .pcmS16LE : asked.encoding)
+        }
+        return request
     }
 
     // MARK: - Running
@@ -153,14 +283,19 @@ public final class RunSession: Identifiable {
     /// What the run is doing now. Starting stamps `startedAt`; an end stamps `finishedAt`.
     public func report(_ phase: Phase) {
         if phase == .submitting {
+            released = false
             startedAt = Date()
             finishedAt = nil
             results = []
             preview = nil
+            streamed = nil
+            received = []
         }
         self.phase = phase
         switch phase {
-        case .finished, .failed, .cancelled: finishedAt = Date()
+        case .finished, .failed, .cancelled:
+            finishedAt = Date()
+            endStreams()
         default: break
         }
     }
@@ -169,12 +304,60 @@ public final class RunSession: Identifiable {
     public func report(preview: Data) { self.preview = preview }
     public func report(results: [RunResult]) { self.results = results }
 
+    /// One chunk of a streamed output (Base §11), in order: kept for late listeners and passed on.
+    public func report(chunk: OutputChunk) {
+        guard phase.isActive, !released else { return }            // released: nothing more is passed on (barge-in)
+        var s = streamed?.output == chunk.output ? streamed! : StreamedOutput(output: chunk.output)
+        if s.chunks == 0, let startedAt = submittedAt ?? startedAt { s.firstChunkAfter = Date().timeIntervalSince(startedAt) }
+        s.format = chunk.format ?? s.format
+        s.chunks += 1
+        s.bytes += chunk.samples?.count ?? 0
+        s.finished = chunk.final
+        streamed = s
+        received.append(chunk)
+        onChunk?(chunk)
+        for listener in listeners.values { listener.yield(chunk) }
+        if chunk.final { endStreams() }
+    }
+
+    /// The streamed output's chunks: those already received, then each as it arrives, until the final one or the run
+    /// ends. A run that has ended has none.
+    public func chunks() -> AsyncStream<OutputChunk> {
+        let (stream, continuation) = AsyncStream<OutputChunk>.makeStream()
+        switch phase {
+        case .finished, .failed, .cancelled:
+            continuation.finish()
+            return stream
+        default: break
+        }
+        for chunk in received { continuation.yield(chunk) }
+        if received.last?.final == true {
+            continuation.finish()
+            return stream
+        }
+        let id = UUID()
+        listeners[id] = continuation
+        continuation.onTermination = { [weak self] _ in Task { @MainActor in self?.listeners[id] = nil } }
+        return stream
+    }
+
+    /// No more chunks: listeners finish, and what was kept for them goes.
+    private func endStreams() {
+        for listener in listeners.values { listener.finish() }
+        listeners = [:]
+        received = []
+    }
+
     /// Runs to the end. Never throws: the outcome is in `phase`.
     public func run() async {
         phase = .submitting
         startedAt = Date()
+        submittedAt = nil
+        released = false
         results = []
         preview = nil
+        streamed = nil
+        received = []
         do {
             // 1. Inputs: inline when small, uploaded otherwise (Base §8). Lite never serves grants.
             var inputs: [String: RequestInput] = [:]
@@ -188,15 +371,25 @@ public final class RunSession: Identifiable {
             }
             for (name, value) in data { inputs[name] = .one(.data(value)) }
             // 2. Submit (Base §7.1) with an idempotency key, so a retry after `busy` can't make a second job.
-            let submitted = try await engine.submit(form.request(media: inputs), idempotencyKey: UUID().uuidString)
+            let request = request(media: inputs)
+            submittedAt = Date()
+            let submitted = try await engine.submit(request, idempotencyKey: UUID().uuidString)
             job = submitted
             phase = .running(state: submitted.state, stage: nil, fraction: nil, message: nil)
-            // 3. Follow its events (Base §11) until it holds its outputs or ends.
+            // 3. Follow its events (Base §11) until it holds its outputs or ends; a streamed output's chunks come
+            //    with them, in order and once (MESClientKit's ChunkReader). The finished file is still collected.
             if submitted.state != .holding && submitted.state != .purged {
-                for try await event in engine.events(job: submitted.id, after: 0) {
-                    apply(event)
-                    if event.type == .outputReady || event.type == .ended { break }
+                var reader = ChunkReader(job: submitted.id, plans: submitted.plan?.streams ?? [])
+                do {
+                    for try await event in engine.events(job: submitted.id, after: 0) {
+                        apply(event)
+                        if request.stream != nil, let chunk = try reader.read(event) { report(chunk: chunk) }
+                        if event.type == .outputReady || event.type == .ended { break }
+                    }
+                } catch is StreamIncomplete {
+                    // The job ended without the stream's final chunk (§11 rule 5): its outcome says why.
                 }
+                endStreams()
             }
             let final = try await engine.job(submitted.id, wait: 0)
             job = final
@@ -222,10 +415,16 @@ public final class RunSession: Identifiable {
             phase = Task.isCancelled ? .cancelled : .failed("\(error)")
         }
         finishedAt = Date()
+        endStreams()
     }
 
     /// Cancels the run: releases the job on the engine (Base §7.3), which ends it `cancelled`.
+    ///
+    /// A streaming run stops at once on this side (no chunk after this one is passed on) and on the engine within a
+    /// chunk, since releasing cancels the job between chunks (barge-in, §11).
     public func cancel() async {
+        released = true
+        endStreams()
         if let executor {
             await executor.cancel(self)
             return

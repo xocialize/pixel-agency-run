@@ -8,7 +8,8 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 /// The right of the workflow: the operation's controls, drawn from its descriptor by MESFormsUI (LITE-4), with
-/// Lite's media slots (LITE-5); the Run button; and, after a run, what happened (LITE-8).
+/// Lite's media slots (LITE-5) and MESFormsUI's audio wells and voice picker; the Run button; and, after a run, what
+/// happened (LITE-8).
 struct Inspector: View {
     @Bindable var workflow: RunWorkflow
 
@@ -19,6 +20,8 @@ struct Inspector: View {
                     VStack(alignment: .leading, spacing: Tokens.Space.l) {
                         OperationFormContent(form: run.form) { spec in InputSlot(workflow: workflow, run: run, spec: spec) }
                             .disabled(run.phase != .editing)
+                            // Streaming follows the model that will run: on where it streams (Base §6.4).
+                            .onChange(of: run.form.model) { run.streamByDefault() }
                         if run.phase == .finished, let result = run.results.first { WhatHappened(run: run, result: result) }
                     }
                     .padding(Tokens.Space.l)
@@ -68,14 +71,29 @@ struct RunBar: View {
     }
 }
 
-/// One non-text input: media, or data.
+/// One non-text input: media, audio, or data.
 struct InputSlot: View {
     let workflow: RunWorkflow
     @Bindable var run: RunSession
     let spec: InputSpec
 
     var body: some View {
-        if spec.kind == .data { DataSlot(run: run, spec: spec) } else { MediaSlot(workflow: workflow, run: run, spec: spec) }
+        switch spec.kind {
+        case .data: DataSlot(run: run, spec: spec)
+        case .audio: AudioSlot(run: run, spec: spec)
+        default: MediaSlot(workflow: workflow, run: run, spec: spec)
+        }
+    }
+}
+
+/// One audio input (Audio §1.1): MESFormsUI's well, to drop or choose a file and play it.
+struct AudioSlot: View {
+    @Bindable var run: RunSession
+    let spec: InputSpec
+
+    var body: some View {
+        AudioInputWell(spec: spec, file: Binding(get: { run.media[spec.name]?.first?.file },
+                                                 set: { run.media[spec.name] = $0.map { [MediaItem(file: $0)] } }))
     }
 }
 

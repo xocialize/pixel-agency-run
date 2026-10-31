@@ -248,7 +248,11 @@ struct SessionRow: View {
 
     var body: some View {
         HStack(spacing: Tokens.Space.s) {
-            Thumbnail(file: run.results.first(where: \.isImage)?.file, size: 28)
+            if let audio = run.results.first(where: \.isAudio), !run.results.contains(where: \.isImage) {
+                WaveformThumbnail(file: audio.file, size: 28)
+            } else {
+                Thumbnail(file: run.results.first(where: \.isImage)?.file, size: 28)
+            }
             VStack(alignment: .leading, spacing: 1) {
                 Text(run.descriptor.title).lineLimit(1)
                 Text(PhaseText.short(run.phase)).font(Tokens.Font.caption).foregroundStyle(Tokens.Color.secondaryLabel)

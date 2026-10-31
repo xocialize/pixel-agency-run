@@ -2,7 +2,9 @@
 
 The run workflow of a [Media Engine Specification (MES)](https://github.com/xocialize/media-engine-spec) client, as a
 Swift package: find an engine, choose an operation, set its controls from the engine's own descriptor, give inputs,
-run, and keep or save the results. Everything goes through the open MES SDKs.
+run, and keep or save the results. Everything goes through the open MES SDKs. It runs the Image profile's operations
+and, from v0.2.0, the Audio profile's (MES Audio 0.1): speech streamed as it's made, voices from the engine, audio
+inputs and results, and data results shown as text.
 
 It was [Pixel Agency Lite](https://github.com/xocialize/pixel-agency-lite)'s (LITE-16, Lite v0.4.2). It moved here so
 that the apps built on it link a package rather than an app repo (Gaea decision G-20, AB-D-0182; work order
@@ -11,19 +13,19 @@ AB-T-0360):
 | App | How it uses the workflow |
 |---|---|
 | [Pixel Agency Desktop](https://github.com/xocialize/pixel-agency-desktop) | Embeds the views in its own window, adds its built-in engine in process, and runs each run as a durable ticket. |
-| Gaea Lab | The MES reference client (Gaea G-14), built on it. |
+| Gaea Lab | The MES reference client (Gaea G-14), built on it: images, and audio with streamed speech (G2). |
 | Pixel Agency Lite | Where it started. Lite is deprecated once Gaea Lab has what is worth keeping. |
 
 ## Install
 
 ```swift
-.package(url: "https://github.com/xocialize/pixel-agency-run.git", from: "0.1.0"),
+.package(url: "https://github.com/xocialize/pixel-agency-run.git", from: "0.2.0"),
 // target dependencies:
 .product(name: "PixelAgencyRun", package: "pixel-agency-run"),
 .product(name: "PixelAgencyRunUI", package: "pixel-agency-run"),
 ```
 
-macOS 26. It depends on media-engine-spec (MESClientKit, MESCore, MESFormsUI) and DesignScaffold. No MLX.
+macOS 26. It depends on media-engine-spec from 0.8.0 (MESClientKit, MESCore, MESFormsUI) and DesignScaffold. No MLX.
 
 ## Contents
 
@@ -32,6 +34,23 @@ macOS 26. It depends on media-engine-spec (MESClientKit, MESCore, MESFormsUI) an
 | `PixelAgencyRun` | **The model.** Engines: discovery over Bonjour (`_mes-engine._tcp`), pairing, credentials in the keychain (`EngineDirectory`, `KeychainCredentialStore`). A run: inputs, controls from the descriptor, progress, results and what happened (`RunWorkflow`, `RunSession`). The session list, the working folder (`WorkingFolder`) and masks. |
 | `PixelAgencyRunUI` | **The views**, on MESFormsUI and DesignScaffold. Engines, operations and this session's runs; the canvas (input, progress and previews, results with Save, Share, Use as Input); the controls from the descriptor, media slots and the mask brush with "select subject"; what happened; working-folder onboarding. |
 | `pa-run` | The same workflow without a window, for the MES client conformance suite. |
+
+## Audio (MES Audio 0.1)
+
+| | What the workflow does |
+|---|---|
+| **Audio inputs** | `MediaItem` reads an audio file's duration, rate and channels (no image probing); a result used as input brings its own facts. The inspector's audio slots are MESFormsUI's `AudioInputWell` (drop or choose, play). "Use as Input" sends an audio result to the next operation's audio slot. |
+| **Voices** | Every run's form gets `VoiceSource(engine:)`, so the `voice` parameter is MESFormsUI's picker over the chosen model's voice list (Base §6.5), with samples. |
+| **Streaming** | Where an output can stream and the model that will run streams (`supports.stream`), streaming is on by default (`RunSession.streamByDefault()`, called again when the model changes; the form's "Stream as it's made" toggle turns it off). The request asks for `pcm_s16le`. While the job runs, its chunks come in order through MESClientKit's `ChunkReader`: `RunSession.streamed` says how much has come and how soon the first chunk did, `chunks()` gives them to a view (those already received first), and `onChunk` to code. The final file is still collected. An executor forwards chunks with `report(chunk:)`. |
+| **Barge-in** | `cancel()` stops passing chunks on at once and releases the job, which the engine stops within a chunk (Base §11). |
+| **Results** | Audio results play in the canvas (`AudioPlayerView`) with their duration, rate and channels from the output's facts; a streamed run plays as it arrives (`PCMStreamPlayer`), with Stop releasing the job. Data and text results (edit_speech's `transcript`, compose's `timestamps` and `score`) are kept as results and shown as text (`RunResult.text`). Audio results get waveform thumbnails. |
+
+`pa-run --stream audio` streams that output: the chunks go to `<out>/audio-stream.wav` as they arrive, the final file is
+saved as usual, and the first chunk's latency is printed:
+
+```bash
+pa-run --engine http://127.0.0.1:17600/mes/v0 --operation audio.speak --model mock-clone --text 'text=Hello there.' --file voice_ref=clip.wav --stream audio --out out
+```
 
 ## Embedding the run workflow
 
@@ -66,7 +85,9 @@ swift test
 ```
 
 The tests run every Image operation end to end against the MES mock engine, with controls entirely from descriptors,
-and the client conformance suite through `pa-run`.
+and the client conformance suite through `pa-run`. Against the mock's audio engine: a streamed speak with a cloned
+voice (and the preset voice list), barge-in, an edit with an audio input and its transcript, generate with count 2,
+compose with timestamps, an audio result as the next input, and `pa-run --stream`.
 
 ## Licence
 

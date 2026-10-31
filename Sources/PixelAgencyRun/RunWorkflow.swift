@@ -106,7 +106,8 @@ public final class RunWorkflow {
     }
 
     /// Starts a run of `descriptor`. Media inputs of the previous run carry over where the new operation takes an
-    /// input of the same name and kind, and a result sent with "use as input" fills the first empty image slot.
+    /// input of the same name and kind, and a result sent with "use as input" fills the first empty slot of its kind
+    /// (image or audio).
     public func choose(_ descriptor: Descriptor) {
         guard let connection, let info else { return }
         let next = RunSession(engine: connection, engineInfo: info, descriptor: descriptor, folder: log.folder)
@@ -119,8 +120,8 @@ public final class RunWorkflow {
                 }
             }
         }
-        if let carried, let slot = descriptor.inputs.first(where: { $0.kind == .image && (next.media[$0.name] ?? []).isEmpty })
-            ?? descriptor.inputs.first(where: { $0.kind == .image }) {
+        if let carried, let slot = descriptor.inputs.first(where: { $0.kind == carried.kind && (next.media[$0.name] ?? []).isEmpty })
+            ?? descriptor.inputs.first(where: { $0.kind == carried.kind }) {
             next.media[slot.name] = [carried]
             self.carried = nil
         }
@@ -158,11 +159,11 @@ public final class RunWorkflow {
     /// image slot, it goes there at once.
     public func useAsInput(_ result: RunResult) { useAsInput(result.asInput) }
 
-    /// Puts a file into the next run (Desktop: a library asset, RUN-3): into the current run's first empty image slot
-    /// while it's being edited, otherwise carried to the next operation chosen.
+    /// Puts a file into the next run (Desktop: a library asset, RUN-3): into the current run's first empty slot of its
+    /// kind (image or audio) while it's being edited, otherwise carried to the next operation chosen.
     public func useAsInput(_ item: MediaItem) {
         if let current, current.phase == .editing,
-           let slot = current.descriptor.inputs.first(where: { $0.kind == .image && (current.media[$0.name] ?? []).isEmpty }) {
+           let slot = current.descriptor.inputs.first(where: { $0.kind == item.kind && (current.media[$0.name] ?? []).isEmpty }) {
             current.media[slot.name] = [item]
         } else {
             carried = item

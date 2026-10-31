@@ -1,12 +1,15 @@
 import AppKit
+import AVFoundation
 import DesignScaffold
+import MESClientKit
 import MESCore
 import MESFormsUI
 import PixelAgencyRun
 import SwiftUI
 
 /// The middle of the workflow: the input picture while editing, live progress and previews while running (LITE-6),
-/// the result when done (LITE-7), and the mask editor when painting a mask (LITE-5).
+/// the result when done (LITE-7), and the mask editor when painting a mask (LITE-5). A streamed output plays as it
+/// arrives (Base §11); audio results play, and data results show as text.
 struct Canvas: View {
     @Bindable var workflow: RunWorkflow
     let saveFolder: URL?
@@ -48,6 +51,7 @@ struct RunCanvas: View {
     @State private var selected = 0
     @State private var saved: URL?
     @State private var problem: String?
+    @State private var listener = StreamListener()
 
     var body: some View {
         VStack(spacing: 0) {
@@ -62,9 +66,12 @@ struct RunCanvas: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .padding(Tokens.Space.l)
+            if listener.isPlaying && !run.phase.isActive { streamBar }
             if run.phase == .finished { resultBar }
         }
         .onChange(of: run.id) { selected = 0; saved = nil }
+        // A streamed run plays as it arrives; the listener joins before the run starts, or late with what came.
+        .task(id: run.id) { await listener.follow(run) }
     }
 
     // MARK: Editing
@@ -92,7 +99,9 @@ struct RunCanvas: View {
 
     var progress: some View {
         VStack(spacing: Tokens.Space.m) {
-            if let preview = run.preview, let image = NSImage(data: preview) {
+            if let streamed = run.streamed {
+                StreamingView(streamed: streamed, playing: listener.isPlaying)
+            } else if let preview = run.preview, let image = NSImage(data: preview) {
                 Image(nsImage: image).resizable().scaledToFit().clipShape(RoundedRectangle(cornerRadius: Tokens.Radius.control))
             } else if let image = firstImage {
                 PictureView(file: image.file, mask: nil).opacity(0.35)
@@ -104,7 +113,13 @@ struct RunCanvas: View {
                     ProgressView().controlSize(.small)
                 }
                 Text(statusLine).font(Tokens.Font.caption).foregroundStyle(Tokens.Color.secondaryLabel)
-                Button("Cancel") { Task { await run.cancel() } }.keyboardShortcut(".", modifiers: .command)
+                if run.streamed != nil {
+                    // Barge-in: the sound stops now, and the engine stops the job within a chunk.
+                    Button { stopStream() } label: { Label("Stop", systemImage: "stop.fill") }
+                        .keyboardShortcut(".", modifiers: .command)
+                } else {
+                    Button("Cancel") { Task { await run.cancel() } }.keyboardShortcut(".", modifiers: .command)
+                }
             }
         }
     }
@@ -118,6 +133,24 @@ struct RunCanvas: View {
         case .collecting: "Collecting the results…"
         default: ""
         }
+    }
+
+    func stopStream() {
+        listener.stop()
+        Task { await run.cancel() }
+    }
+
+    /// The stream still playing out after its run ended.
+    var streamBar: some View {
+        HStack(spacing: Tokens.Space.s) {
+            Image(systemName: "waveform").foregroundStyle(Tokens.Color.accent)
+            Text("Playing the stream as it arrived").font(Tokens.Font.caption).foregroundStyle(Tokens.Color.secondaryLabel)
+            Spacer()
+            Button { listener.stop() } label: { Label("Stop", systemImage: "stop.fill") }
+        }
+        .controlSize(.small)
+        .padding(.horizontal, Tokens.Space.l).padding(.vertical, Tokens.Space.xs)
+        .background(.bar)
     }
 
     func ended(_ title: String, _ detail: String, symbol: String, tint: Color) -> some View {
@@ -141,9 +174,22 @@ struct RunCanvas: View {
                           ByteCountFormatter.string(fromByteCount: Int64(result.output.bytes), countStyle: .file)]
                         .compactMap { $0 }.joined(separator: " · "))
                         .font(Tokens.Font.caption).foregroundStyle(Tokens.Color.secondaryLabel)
+                } else if result.isAudio {
+                    Spacer(minLength: 0)
+                    VStack(alignment: .leading, spacing: Tokens.Space.s) {
+                        AudioPlayerView(file: result.file, title: FormSchema.label(result.output.name))
+                        Text([result.audioFacts, result.output.mediaType,
+                              ByteCountFormatter.string(fromByteCount: Int64(result.output.bytes), countStyle: .file)]
+                            .compactMap { $0 }.joined(separator: " · "))
+                            .font(Tokens.Font.caption).foregroundStyle(Tokens.Color.secondaryLabel)
+                    }
+                    .padding(Tokens.Space.m)
+                    .frame(maxWidth: 520)
+                    .cardSurface()
+                    Spacer(minLength: 0)
                 } else {
                     ScrollView {
-                        Text(Self.json(result)).font(Tokens.Font.mono).textSelection(.enabled)
+                        Text(result.text).font(Self.isProse(result) ? Tokens.Font.body : Tokens.Font.mono).textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading).padding(Tokens.Space.m)
                     }
                     .cardSurface()
@@ -154,7 +200,7 @@ struct RunCanvas: View {
                     ForEach(Array(run.results.enumerated()), id: \.offset) { i, r in
                         Button { selected = i } label: {
                             VStack(spacing: 2) {
-                                Thumbnail(file: r.isImage ? r.file : nil, size: 44)
+                                ResultThumbnail(result: r, size: 44)
                                 Text(r.output.name).font(Tokens.Font.caption)
                             }
                             .padding(3)
@@ -176,7 +222,7 @@ struct RunCanvas: View {
                     .disabled(saveFolder == nil).help(saveFolder.map { "Save to \($0.lastPathComponent)" } ?? "Choose a working folder first")
                 Button("Save As…") { saveAs(result) }
                 ShareLink(item: result.file) { Label("Share", systemImage: "square.and.arrow.up") }
-                if result.isImage {
+                if result.isImage || result.isAudio {
                     Button { workflow.useAsInput(result) } label: { Label("Use as Input", systemImage: "arrow.uturn.right") }
                         .help("Send this result to the next operation you choose")
                 }
@@ -229,11 +275,116 @@ struct RunCanvas: View {
         NSWorkspace.shared.open([file], withApplicationAt: app, configuration: NSWorkspace.OpenConfiguration())
     }
 
-    static func json(_ result: RunResult) -> String {
-        let value = result.output.value ?? (try? MESJSON.decoder.decode(JSONValue.self, from: Data(contentsOf: result.file))) ?? .null
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        return (try? String(decoding: encoder.encode(value), as: UTF8.self)) ?? ""
+    /// A transcript, timed lines or a text output reads as text; other data as JSON.
+    static func isProse(_ result: RunResult) -> Bool {
+        if result.output.kind == .text { return true }
+        guard let object = result.value?.objectValue, object.count == 1 else { return false }
+        return object["text"] != nil || object["lines"] != nil
+    }
+}
+
+/// A streamed output arriving: how much sound has come, and how soon the first of it did.
+struct StreamingView: View {
+    let streamed: StreamedOutput
+    let playing: Bool
+
+    var body: some View {
+        VStack(spacing: Tokens.Space.s) {
+            Image(systemName: playing ? "waveform" : "waveform.slash")
+                .font(.system(size: 36)).foregroundStyle(playing ? Tokens.Color.accent : Tokens.Color.secondaryLabel)
+                .symbolEffect(.variableColor.iterative, isActive: playing && !streamed.finished)
+            Text("\(FormSchema.label(streamed.output)) streaming").font(Tokens.Font.panelTitle)
+            Text([String(format: "%.1f s received", streamed.seconds),
+                  "\(streamed.chunks) chunk\(streamed.chunks == 1 ? "" : "s")",
+                  streamed.firstChunkAfter.map { "first after \(Int(($0 * 1000).rounded())) ms" },
+                  streamed.format.map { AudioFacts.line(duration: nil, sampleRate: $0.sampleRate, channels: $0.channels) ?? "" }]
+                .compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · "))
+                .font(Tokens.Font.caption).foregroundStyle(Tokens.Color.secondaryLabel).monospacedDigit()
+        }
+    }
+}
+
+/// Plays a run's streamed output as it arrives (MESFormsUI's PCMStreamPlayer), and lets what's scheduled play out
+/// after the run ends. Stopping silences it at once.
+@MainActor @Observable
+final class StreamListener {
+    private(set) var isPlaying = false
+    @ObservationIgnored private var player: PCMStreamPlayer?
+
+    func follow(_ run: RunSession) async {
+        stop()
+        for await chunk in run.chunks() {
+            if player == nil, let format = chunk.format { player = try? PCMStreamPlayer(format: format) }
+            guard let player else { continue }
+            try? player.enqueue(chunk)
+            isPlaying = player.scheduledFrames > 0
+        }
+        // Only a stream that got its final chunk plays out; a released one (barge-in) stops now.
+        guard !Task.isCancelled, run.streamed?.finished == true, let player, player.scheduledFrames > 0 else { stop(); return }
+        player.finish()
+        while !Task.isCancelled, isPlaying, !player.isDone { try? await Task.sleep(for: .milliseconds(100)) }
+        if self.player === player { stop() }
+    }
+
+    func stop() {
+        player?.stop()
+        player = nil
+        isPlaying = false
+    }
+}
+
+/// A result's thumbnail: the picture, the sound's waveform, or a document for text.
+struct ResultThumbnail: View {
+    let result: RunResult
+    let size: CGFloat
+
+    var body: some View {
+        if result.isAudio {
+            WaveformThumbnail(file: result.file, size: size)
+        } else if result.isText {
+            Image(systemName: "doc.text").foregroundStyle(Tokens.Color.tertiaryLabel).frame(width: size, height: size)
+        } else {
+            Thumbnail(file: result.isImage ? result.file : nil, size: size)
+        }
+    }
+}
+
+/// A sound's waveform, small: peaks across the file.
+struct WaveformThumbnail: View {
+    let file: URL
+    let size: CGFloat
+    @State private var peaks: [Float] = []
+
+    var body: some View {
+        SwiftUI.Canvas { context, area in
+            guard !peaks.isEmpty else { return }
+            let step = area.width / CGFloat(peaks.count)
+            for (i, peak) in peaks.enumerated() {
+                let h = max(1, CGFloat(peak) * area.height * 0.9)
+                context.fill(Path(CGRect(x: CGFloat(i) * step + step * 0.15, y: (area.height - h) / 2, width: step * 0.7, height: h)),
+                             with: .color(Tokens.Color.accent))
+            }
+        }
+        .frame(width: size, height: size)
+        .background(Tokens.Color.fieldFill, in: RoundedRectangle(cornerRadius: 4))
+        .overlay { if peaks.isEmpty { Image(systemName: "waveform").foregroundStyle(Tokens.Color.tertiaryLabel) } }
+        .task(id: file) { peaks = await Self.peaks(file, bars: 16) }
+        .accessibilityLabel("Sound: \(file.lastPathComponent)")
+    }
+
+    /// The loudest sample of each of `bars` stretches of the file, normalized to the loudest.
+    nonisolated static func peaks(_ file: URL, bars: Int) async -> [Float] {
+        guard let audio = try? AVAudioFile(forReading: file), audio.length > 0,
+              let buffer = AVAudioPCMBuffer(pcmFormat: audio.processingFormat, frameCapacity: AVAudioFrameCount(min(audio.length, 48_000 * 600))),
+              (try? audio.read(into: buffer)) != nil, let data = buffer.floatChannelData else { return [] }
+        let frames = Int(buffer.frameLength), per = max(1, frames / bars)
+        var peaks = (0..<bars).map { bar -> Float in
+            let range = (bar * per)..<min(frames, (bar + 1) * per)
+            return range.isEmpty ? 0 : range.reduce(0) { max($0, abs(data[0][$1])) }
+        }
+        let loudest = peaks.max() ?? 0
+        if loudest > 0 { peaks = peaks.map { $0 / loudest } }
+        return peaks
     }
 }
 

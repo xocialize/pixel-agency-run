@@ -24,7 +24,7 @@ func engineConfig(_ tweak: (inout EngineConfiguration) -> Void = { _ in }) -> En
 }
 
 @MainActor
-func serve(_ config: EngineConfiguration, engine: MockImageEngine = MockImageEngine(), _ body: @MainActor (Int) async throws -> Void) async throws {
+func serve(_ config: EngineConfiguration, engine: any MediaEngine = MockImageEngine(), _ body: @MainActor (Int) async throws -> Void) async throws {
     let server = MESEngineServer(engine: engine, configuration: config)
     let (ports, continuation) = AsyncStream<Int>.makeStream()
     let app = try await server.makeApplication { port in continuation.yield(port) }
