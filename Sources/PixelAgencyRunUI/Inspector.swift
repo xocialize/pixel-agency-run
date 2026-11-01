@@ -8,8 +8,8 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 /// The right of the workflow: the operation's controls, drawn from its descriptor by MESFormsUI (LITE-4), with
-/// Lite's media slots (LITE-5) and MESFormsUI's audio wells and voice picker; the Run button; and, after a run, what
-/// happened (LITE-8).
+/// Lite's media slots (LITE-5) and MESFormsUI's audio and video wells and voice picker; the terms a licence asks each
+/// user to accept (Base §10.2 rule 4); the Run button; and, after a run, what happened (LITE-8).
 struct Inspector: View {
     @Bindable var workflow: RunWorkflow
 
@@ -22,6 +22,7 @@ struct Inspector: View {
                             .disabled(run.phase != .editing)
                             // Streaming follows the model that will run: on where it streams (Base §6.4).
                             .onChange(of: run.form.model) { run.streamByDefault() }
+                        AcceptedTerms(run: run)
                         if run.phase == .finished, let result = run.results.first { WhatHappened(run: run, result: result) }
                     }
                     .padding(Tokens.Space.l)
@@ -43,6 +44,10 @@ struct RunBar: View {
     var body: some View {
         VStack(alignment: .leading, spacing: Tokens.Space.xs) {
             if run.phase == .editing {
+                // Before a run on an offer whose terms bind its users: the terms, the notice, Accept.
+                ForEach(run.needsAcceptance, id: \.spdx) { license in
+                    LicenseAcceptanceView(license: license, title: TermsNeeded.title(of: license, in: run), acceptances: run.acceptances)
+                }
                 if let missing = run.missingInputs.first {
                     Text("Needs \(FormSchema.label(missing.name).lowercased()).").font(Tokens.Font.caption).foregroundStyle(Tokens.Color.secondaryLabel)
                 } else if let issue = run.form.issues.first {
@@ -81,6 +86,7 @@ struct InputSlot: View {
         switch spec.kind {
         case .data: DataSlot(run: run, spec: spec)
         case .audio: AudioSlot(run: run, spec: spec)
+        case .video: VideoSlot(run: run, spec: spec)
         default: MediaSlot(workflow: workflow, run: run, spec: spec)
         }
     }
@@ -94,6 +100,61 @@ struct AudioSlot: View {
     var body: some View {
         AudioInputWell(spec: spec, file: Binding(get: { run.media[spec.name]?.first?.file },
                                                  set: { run.media[spec.name] = $0.map { [MediaItem(file: $0)] } }))
+    }
+}
+
+/// One video input (Video §1.1): MESFormsUI's well, to drop or choose a clip and play it with its facts. A file
+/// chosen here has its facts read; a previous result keeps the engine's.
+struct VideoSlot: View {
+    @Bindable var run: RunSession
+    let spec: InputSpec
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Tokens.Space.xs) {
+            VideoInputWell(spec: spec, file: Binding(get: { run.media[spec.name]?.first?.file }, set: set))
+            if let facts = run.media[spec.name]?.first?.videoFacts {
+                Text(facts.line).font(Tokens.Font.caption).foregroundStyle(Tokens.Color.secondaryLabel)
+            }
+        }
+    }
+
+    func set(_ file: URL?) {
+        guard let file else { run.media[spec.name] = nil; return }
+        guard run.media[spec.name]?.first?.file != file else { return }
+        run.media[spec.name] = [MediaItem(file: file)]
+        Task {
+            let item = await MediaItem.reading(file)
+            if run.media[spec.name]?.first?.file == file { run.media[spec.name] = [item] }
+        }
+    }
+}
+
+/// The licences of this operation's offers that bind each user (Base §10.2 rule 4) and this user has accepted: shown as
+/// accepted, with a way to take the acceptance back.
+struct AcceptedTerms: View {
+    let run: RunSession
+
+    var accepted: [License] {
+        run.form.licencesNeedingAcceptance.filter { run.acceptances.accepted.contains($0.spdx) }
+    }
+
+    var body: some View {
+        if !accepted.isEmpty {
+            VStack(alignment: .leading, spacing: Tokens.Space.xs) {
+                SectionHeader("Terms you've accepted")
+                ForEach(accepted, id: \.spdx) { license in
+                    HStack(alignment: .firstTextBaseline) {
+                        Label(license.spdx, systemImage: "checkmark.seal").foregroundStyle(Tokens.Color.ready)
+                        Spacer()
+                        if let url = license.termsURL.flatMap(URL.init(string:)) { Link("Terms", destination: url) }
+                        Button("Revoke") { run.acceptances.revoke(license) }
+                            .help("Take back your acceptance: models under \(license.spdx) won't run for you until you accept again")
+                    }
+                    .font(Tokens.Font.caption)
+                    .controlSize(.small)
+                }
+            }
+        }
     }
 }
 

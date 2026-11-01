@@ -9,7 +9,8 @@ import SwiftUI
 
 /// The middle of the workflow: the input picture while editing, live progress and previews while running (LITE-6),
 /// the result when done (LITE-7), and the mask editor when painting a mask (LITE-5). A streamed output plays as it
-/// arrives (Base §11); audio results play, and data results show as text.
+/// arrives (Base §11); audio results play, and data results show as text. A video plays with its facts: a running job's
+/// stills show as they come (Video §1.14), and a result's frames under it.
 struct Canvas: View {
     @Bindable var workflow: RunWorkflow
     let saveFolder: URL?
@@ -59,7 +60,12 @@ struct RunCanvas: View {
                 switch run.phase {
                 case .finished: results
                 case .submitting, .running, .collecting: progress
-                case .failed(let message): ended("The run failed", message, symbol: "exclamationmark.triangle", tint: Tokens.Color.failure)
+                case .failed(let message):
+                    if !run.refusedTerms.isEmpty {
+                        TermsNeeded(workflow: workflow, run: run)
+                    } else {
+                        ended("The run failed", message, symbol: "exclamationmark.triangle", tint: Tokens.Color.failure)
+                    }
                 case .cancelled: ended("Cancelled", "The engine stopped the job and discarded it.", symbol: "xmark.circle", tint: Tokens.Color.secondaryLabel)
                 case .editing: editing
                 }
@@ -80,6 +86,8 @@ struct RunCanvas: View {
         Group {
             if let image = firstImage {
                 PictureView(file: image.file, mask: maskFile)
+            } else if let clip = firstVideo {
+                VideoPlayerView(file: clip.file, title: clip.name, facts: clip.videoFacts).frame(maxWidth: 720)
             } else {
                 EmptyState(title: run.descriptor.title,
                            detail: run.missingInputs.isEmpty ? "Set the controls on the right, then Run." : "Needs: \(run.missingInputs.map { FormSchema.label($0.name) }.joined(separator: ", ")).")
@@ -89,6 +97,10 @@ struct RunCanvas: View {
 
     var firstImage: MediaItem? {
         run.descriptor.inputs.filter { $0.kind == .image }.lazy.compactMap { run.media[$0.name]?.first }.first
+    }
+
+    var firstVideo: MediaItem? {
+        run.descriptor.inputs.filter { $0.kind == .video }.lazy.compactMap { run.media[$0.name]?.first }.first
     }
 
     var maskFile: URL? {
@@ -101,6 +113,10 @@ struct RunCanvas: View {
         VStack(spacing: Tokens.Space.m) {
             if let streamed = run.streamed {
                 StreamingView(streamed: streamed, playing: listener.isPlaying)
+            } else if let latest = run.framePreviews.frames.last, let image = NSImage(data: latest.image) {
+                // A video's stills, as the engine sends them: the newest large, all of them in time order below.
+                Image(nsImage: image).resizable().scaledToFit().clipShape(RoundedRectangle(cornerRadius: Tokens.Radius.control))
+                FramePreviewStrip(frames: run.framePreviews.frames)
             } else if let preview = run.preview, let image = NSImage(data: preview) {
                 Image(nsImage: image).resizable().scaledToFit().clipShape(RoundedRectangle(cornerRadius: Tokens.Radius.control))
             } else if let image = firstImage {
@@ -174,6 +190,12 @@ struct RunCanvas: View {
                           ByteCountFormatter.string(fromByteCount: Int64(result.output.bytes), countStyle: .file)]
                         .compactMap { $0 }.joined(separator: " · "))
                         .font(Tokens.Font.caption).foregroundStyle(Tokens.Color.secondaryLabel)
+                } else if result.isVideo {
+                    VideoPlayerView(file: result.file, title: FormSchema.label(result.output.name), facts: result.videoFacts)
+                    FramePreviewStrip(file: result.file, count: 8)
+                    Text([result.output.mediaType, ByteCountFormatter.string(fromByteCount: Int64(result.output.bytes), countStyle: .file)]
+                        .joined(separator: " · "))
+                        .font(Tokens.Font.caption).foregroundStyle(Tokens.Color.secondaryLabel)
                 } else if result.isAudio {
                     Spacer(minLength: 0)
                     VStack(alignment: .leading, spacing: Tokens.Space.s) {
@@ -222,7 +244,7 @@ struct RunCanvas: View {
                     .disabled(saveFolder == nil).help(saveFolder.map { "Save to \($0.lastPathComponent)" } ?? "Choose a working folder first")
                 Button("Save As…") { saveAs(result) }
                 ShareLink(item: result.file) { Label("Share", systemImage: "square.and.arrow.up") }
-                if result.isImage || result.isAudio {
+                if result.isImage || result.isAudio || result.isVideo {
                     Button { workflow.useAsInput(result) } label: { Label("Use as Input", systemImage: "arrow.uturn.right") }
                         .help("Send this result to the next operation you choose")
                 }
@@ -341,11 +363,68 @@ struct ResultThumbnail: View {
     var body: some View {
         if result.isAudio {
             WaveformThumbnail(file: result.file, size: size)
+        } else if result.isVideo {
+            VideoThumbnail(file: result.file, size: size)
         } else if result.isText {
             Image(systemName: "doc.text").foregroundStyle(Tokens.Color.tertiaryLabel).frame(width: size, height: size)
         } else {
             Thumbnail(file: result.isImage ? result.file : nil, size: size)
         }
+    }
+}
+
+/// A clip's first frame, small, marked as video.
+struct VideoThumbnail: View {
+    let file: URL
+    let size: CGFloat
+    @State private var still: NSImage?
+
+    var body: some View {
+        ZStack(alignment: .bottomTrailing) {
+            if let still {
+                Image(nsImage: still).resizable().scaledToFill()
+            } else {
+                Image(systemName: "film").foregroundStyle(Tokens.Color.tertiaryLabel)
+            }
+            Image(systemName: "play.fill").font(.system(size: max(7, size / 5))).foregroundStyle(.white)
+                .shadow(radius: 1).padding(2)
+        }
+        .frame(width: size, height: size)
+        .background(Tokens.Color.fieldFill)
+        .clipShape(RoundedRectangle(cornerRadius: 4))
+        .task(id: file) {
+            still = (try? await FrameThumbnails.make(file, count: 1, maxSide: size * 2))?.first.flatMap { NSImage(data: $0.image) }
+        }
+        .accessibilityLabel("Video: \(file.lastPathComponent)")
+    }
+}
+
+/// A run the engine refused for terms its user hasn't accepted (Base §10.3): each licence with its notice and Accept,
+/// then the run again.
+struct TermsNeeded: View {
+    let workflow: RunWorkflow
+    let run: RunSession
+
+    var body: some View {
+        VStack(spacing: Tokens.Space.m) {
+            Image(systemName: "checkmark.seal").font(.system(size: 28)).foregroundStyle(Tokens.Color.degraded)
+            Text("This model needs your acceptance").font(Tokens.Font.panelTitle)
+            Text("Its licence binds each person who uses it. Read the terms, accept them, then run again.")
+                .font(Tokens.Font.caption).foregroundStyle(Tokens.Color.secondaryLabel).multilineTextAlignment(.center)
+            ForEach(run.refusedTerms, id: \.spdx) { license in
+                LicenseAcceptanceView(license: license, title: Self.title(of: license, in: run), acceptances: run.acceptances)
+            }
+            Button("Run Again") { workflow.again() }
+                .buttonStyle(.borderedProminent)
+                .disabled(!run.needsAcceptance.isEmpty)
+        }
+        .frame(maxWidth: 460)
+    }
+
+    /// The offers under `license`, by title.
+    static func title(of license: License, in run: RunSession) -> String {
+        let titles = run.descriptor.models.filter { $0.license.spdx == license.spdx }.map(\.title)
+        return titles.isEmpty ? "This model" : titles.joined(separator: ", ")
     }
 }
 

@@ -248,7 +248,9 @@ struct SessionRow: View {
 
     var body: some View {
         HStack(spacing: Tokens.Space.s) {
-            if let audio = run.results.first(where: \.isAudio), !run.results.contains(where: \.isImage) {
+            if let clip = run.results.first(where: \.isVideo) {
+                VideoThumbnail(file: clip.file, size: 28)
+            } else if let audio = run.results.first(where: \.isAudio), !run.results.contains(where: \.isImage) {
                 WaveformThumbnail(file: audio.file, size: 28)
             } else {
                 Thumbnail(file: run.results.first(where: \.isImage)?.file, size: 28)

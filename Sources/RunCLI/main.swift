@@ -12,6 +12,13 @@ import PixelAgencyRun
 ///
 /// `--stream audio` asks for the output as it's made (Base §11): the chunks received are written to
 /// `<out>/audio-stream.wav` as they arrive, the finished file is saved as usual, and the first chunk's latency is printed.
+///
+/// Video (Video 0.1): a clip is a `--file` like any medium (`--file video=clip.mp4`, `--file first_frame=still.png`,
+/// keyframes as `--file keyframes=a.png --file keyframes=b.png` with `--param 'keyframe_times=[1,3]'`). A video result's
+/// facts are printed (`video 1280×704 · 24 fps · 121 frames · 5.04 s · sound 48 kHz stereo`). `--previews` writes the
+/// stills the engine sends while it runs to `<out>/previews/`. `--accept <spdx>` sends the licence in `policy.accepted`
+/// (Base §10.2 rule 4): the user of this command accepts its terms. Without it an offer that needs it is refused, and
+/// the command says which `--accept` to give.
 @main
 struct PARun: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
@@ -29,6 +36,8 @@ struct PARun: AsyncParsableCommand {
     @Option(help: "The engine certificate's SHA-256 (hex).") var pin: String?
     @Option(help: "Where to save the results.") var out: String
     @Option(help: "Stream this output as it's made (e.g. audio): write the chunks, then the final file.") var stream: String?
+    @Option(help: "Accept a licence's terms (its spdx id), sent in policy.accepted. Repeatable.") var accept: [String] = []
+    @Flag(help: "Write the stills the engine sends while it runs (job.preview) to <out>/previews/.") var previews = false
 
     @MainActor
     func run() async throws {
@@ -47,7 +56,7 @@ struct PARun: AsyncParsableCommand {
         }
         for pair in file {
             let (name, path) = try Self.split(pair)
-            run.media[name, default: []].append(MediaItem(file: URL(fileURLWithPath: (path as NSString).expandingTildeInPath)))
+            run.media[name, default: []].append(await MediaItem.reading(URL(fileURLWithPath: (path as NSString).expandingTildeInPath)))
         }
         for pair in data {
             let (name, value) = try Self.split(pair)
@@ -61,6 +70,11 @@ struct PARun: AsyncParsableCommand {
             run.form.setValue((try? MESJSON.decoder.decode(JSONValue.self, from: Data(value.utf8))) ?? .string(value), at: [name])
         }
         run.form.model = model
+        // Users' acceptance: what's given here is sent, whether or not the descriptor lists it.
+        if !accept.isEmpty {
+            for license in run.form.licencesNeedingAcceptance where accept.contains(license.spdx) { run.acceptances.accept(license) }
+            run.form.policy.accepted = accept.sorted()
+        }
         if let missing = run.missingInputs.first { throw ValidationError("\(operation) needs input '\(missing.name)'.") }
         let folder = URL(fileURLWithPath: (out as NSString).expandingTildeInPath, isDirectory: true)
 
@@ -96,13 +110,33 @@ struct PARun: AsyncParsableCommand {
             }
             if let url = try writer?.finish() { print("saved \(url.path)") }
         }
+        if previews, !run.framePreviews.frames.isEmpty {
+            let dir = folder.appendingPathComponent("previews", isDirectory: true)
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            for frame in run.framePreviews.frames {
+                let name = String(format: "preview-%08.3fs", frame.atSeconds) + (frame.frame.map { "-frame\($0)" } ?? "")
+                let file = dir.appendingPathComponent("\(name).\(MediaType.fileExtension(frame.mediaType))")
+                try frame.image.write(to: file)
+                print("preview \(String(format: "%.3f", frame.atSeconds)) s\(frame.frame.map { " (frame \($0))" } ?? "") \(file.path)")
+            }
+        } else if previews {
+            print("no previews arrived")
+        }
         switch run.phase {
         case .finished:
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-            for result in run.results { print("saved \(try ResultExporter.save(result, to: folder).path)") }
+            for result in run.results {
+                print("saved \(try ResultExporter.save(result, to: folder).path)")
+                if let facts = result.videoFacts { print("video \(facts.line)") }
+            }
             if let p = run.results.first?.provenance { print("model \(p.model.id) · \(p.model.license.spdx)") }
+            for warning in run.results.first?.job.warnings ?? [] { print("warning \(warning.code): \(warning.message)") }
         case .failed(let message):
             FileHandle.standardError.write(Data("failed: \(message)\n".utf8))
+            if !run.refusedTerms.isEmpty {
+                let flags = run.refusedTerms.map { "--accept \($0.spdx)" }.joined(separator: " ")
+                FileHandle.standardError.write(Data("needs acceptance: read the terms (\(run.refusedTerms.compactMap(\.termsURL).joined(separator: ", "))), then add \(flags)\n".utf8))
+            }
             throw ExitCode.failure
         case .cancelled:
             FileHandle.standardError.write(Data("cancelled\n".utf8))

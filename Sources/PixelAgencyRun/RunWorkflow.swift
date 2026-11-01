@@ -35,10 +35,14 @@ public final class RunWorkflow {
     public weak var executor: (any RunExecutor)?
     /// A result waiting to become the next operation's input (LITE-12).
     public private(set) var carried: MediaItem?
+    /// The licences this client's user has accepted (Base §10.2 rule 4), shared by every run: each sends the accepted
+    /// ones of its offers in `policy.accepted`. Kept in the user's defaults unless given others.
+    public var acceptances: LicenseAcceptances
 
-    public init(directory: EngineDirectory, log: SessionLog) {
+    public init(directory: EngineDirectory, log: SessionLog, acceptances: LicenseAcceptances = .shared) {
         self.directory = directory
         self.log = log
+        self.acceptances = acceptances
     }
 
     // MARK: - Engines
@@ -107,11 +111,12 @@ public final class RunWorkflow {
 
     /// Starts a run of `descriptor`. Media inputs of the previous run carry over where the new operation takes an
     /// input of the same name and kind, and a result sent with "use as input" fills the first empty slot of its kind
-    /// (image or audio).
+    /// (image, audio or video: a generated clip becomes extend's, retake's, upscale's or interpolate's `video`).
     public func choose(_ descriptor: Descriptor) {
         guard let connection, let info else { return }
         let next = RunSession(engine: connection, engineInfo: info, descriptor: descriptor, folder: log.folder)
         next.executor = executor
+        next.acceptances = acceptances
         next.form.policy.license = commercialOnlyByDefault ? .commercialUse : nil
         if let previous = current {
             for spec in descriptor.inputs where spec.kind != .text {
@@ -156,11 +161,11 @@ public final class RunWorkflow {
     public func show(_ run: RunSession) { current = run }
 
     /// Sends a result to the next operation (LITE-12). If the current run is still being edited and has an empty
-    /// image slot, it goes there at once.
+    /// slot of its kind, it goes there at once.
     public func useAsInput(_ result: RunResult) { useAsInput(result.asInput) }
 
     /// Puts a file into the next run (Desktop: a library asset, RUN-3): into the current run's first empty slot of its
-    /// kind (image or audio) while it's being edited, otherwise carried to the next operation chosen.
+    /// kind (image, audio or video) while it's being edited, otherwise carried to the next operation chosen.
     public func useAsInput(_ item: MediaItem) {
         if let current, current.phase == .editing,
            let slot = current.descriptor.inputs.first(where: { $0.kind == item.kind && (current.media[$0.name] ?? []).isEmpty }) {

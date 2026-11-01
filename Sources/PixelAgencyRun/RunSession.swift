@@ -15,16 +15,21 @@ public struct MediaItem: Identifiable, Sendable, Hashable {
     public var name: String
     public var width: Int?
     public var height: Int?
-    /// Audio facts (Audio §1.1): read from the file, or a result's own (Base §10.1).
+    /// Audio facts (Audio §1.1): read from the file, or a result's own (Base §10.1). A video's sound has them too.
     public var durationSeconds: Double?
     public var sampleRate: Int?
     public var channels: Int?
+    /// Video facts (Video §1.1): the rate and the frame count, read from the file or a result's own.
+    public var fps: Double?
+    public var frames: Int?
 
-    /// Images are probed for their size and audio for its duration, rate and channels; nothing else is read.
+    /// Images are probed for their size and audio for its duration, rate and channels; nothing else is read. A video
+    /// isn't probed here: `reading(_:)` reads its facts.
     public init(file: URL, mediaType: String? = nil, name: String? = nil) {
         self.file = file
         self.mediaType = mediaType ?? MediaType.infer(file)
         self.name = name ?? file.lastPathComponent
+        if isVideo { return }
         if isAudio {
             if let audio = try? AVAudioFile(forReading: file) {
                 let format = audio.fileFormat
@@ -41,6 +46,14 @@ public struct MediaItem: Identifiable, Sendable, Hashable {
         }
     }
 
+    /// A file as an input with its facts: a video's size, rate, frames, duration and sound read with AVFoundation
+    /// (`VideoFacts.read`), anything else as `init(file:)` probes it. A video that can't be read keeps no facts.
+    public static func reading(_ file: URL, mediaType: String? = nil, name: String? = nil) async -> MediaItem {
+        var item = MediaItem(file: file, mediaType: mediaType, name: name)
+        if item.isVideo, let facts = try? await VideoFacts.read(file) { item.videoFacts = facts }
+        return item
+    }
+
     /// An output as an input: its facts come from the engine (Base §10.1), so the file isn't probed.
     public init(file: URL, output: Output, name: String) {
         self.file = file
@@ -51,11 +64,29 @@ public struct MediaItem: Identifiable, Sendable, Hashable {
         durationSeconds = output.durationSeconds
         sampleRate = output.sampleRate
         channels = output.channels
+        fps = output.fps
+        frames = output.frames
     }
 
     public var isAudio: Bool { mediaType.hasPrefix("audio/") }
-    /// The kind of input slot this item fills: `audio` for sound, `image` for everything else (masks are images).
-    public var kind: Kind { isAudio ? .audio : .image }
+    public var isVideo: Bool { mediaType.hasPrefix("video/") }
+    /// The kind of input slot this item fills: `audio` for sound, `video` for clips, `image` for everything else
+    /// (masks are images).
+    public var kind: Kind { isAudio ? .audio : isVideo ? .video : .image }
+
+    /// A video's facts, when known: "1280×704 · 24 fps · 121 frames · 5.04 s · sound 48 kHz stereo".
+    public var videoFacts: VideoFacts? {
+        get {
+            guard isVideo, let width, let height, let fps else { return nil }
+            return VideoFacts(width: width, height: height, fps: fps, frames: frames,
+                              durationSeconds: durationSeconds ?? frames.map { Double($0) / fps } ?? 0,
+                              sampleRate: sampleRate, channels: channels)
+        }
+        set {
+            width = newValue?.width; height = newValue?.height; fps = newValue?.fps; frames = newValue?.frames
+            durationSeconds = newValue?.durationSeconds; sampleRate = newValue?.sampleRate; channels = newValue?.channels
+        }
+    }
 }
 
 /// Audio facts for people: "0:03 · 24 kHz · mono".
@@ -87,12 +118,15 @@ public struct RunResult: Identifiable, Sendable, Hashable {
     public var effective: [String: JSONValue] { job.result?.effective ?? [:] }
     public var isImage: Bool { output.kind == .image || output.kind == .mask }
     public var isAudio: Bool { output.kind == .audio }
+    public var isVideo: Bool { output.kind == .video }
     /// Data and text outputs (edit_speech's `transcript`, compose's `timestamps` and `score`), shown as text.
     public var isText: Bool { output.kind == .data || output.kind == .text }
     /// Duration, rate and channels, from the output's facts (Base §10.1).
     public var audioFacts: String? {
         AudioFacts.line(duration: output.durationSeconds, sampleRate: output.sampleRate, channels: output.channels)
     }
+    /// A video's size, rate, frames, duration and sound, from the output's facts (Base §10.1); nil for other outputs.
+    public var videoFacts: VideoFacts? { isVideo ? VideoFacts(output: output) : nil }
 
     public static func == (a: RunResult, b: RunResult) -> Bool { a.id == b.id }
     public func hash(into hasher: inout Hasher) { hasher.combine(id) }
@@ -105,7 +139,7 @@ public struct RunResult: Identifiable, Sendable, Hashable {
 
     /// Use this result as the next operation's input (LITE-12), without saving it.
     public var asInput: MediaItem {
-        isAudio ? MediaItem(file: file, output: output, name: "\(job.operation) result")
+        isAudio || isVideo ? MediaItem(file: file, output: output, name: "\(job.operation) result")
             : MediaItem(file: file, mediaType: output.mediaType, name: "\(job.operation) result")
     }
 
@@ -203,6 +237,12 @@ public final class RunSession: Identifiable {
     public private(set) var job: Job?
     /// The latest preview the engine sent while running (`job.preview`), as image bytes.
     public private(set) var preview: Data?
+    /// The stills of a video output the engine sent while running (`job.preview` with `at_s`, Video §1.14), in time
+    /// order. `preview` still holds the latest of them.
+    public let framePreviews = FramePreviews()
+    /// The licences whose terms the engine wouldn't run without (422 `policy_unmet`, reason `terms_not_accepted`,
+    /// Base §10.3): the run needs its user's acceptance, not a fix.
+    public private(set) var refusedTerms: [License] = []
     public private(set) var results: [RunResult] = []
     /// The output streaming while the job runs (Base §11), when the run asked for a stream.
     public private(set) var streamed: StreamedOutput?
@@ -247,6 +287,53 @@ public final class RunSession: Identifiable {
 
     public var canRun: Bool { !phase.isActive && missingInputs.isEmpty && form.issues.isEmpty }
 
+    // MARK: - Users' acceptance (Base §10.2 rule 4, §10.3)
+
+    /// This user's acceptances: the form sends every accepted licence of the operation's offers in `policy.accepted`.
+    /// A workflow gives each run its own, kept across launches; a lone session keeps them in memory.
+    public var acceptances: LicenseAcceptances {
+        get { form.acceptances }
+        set { form.acceptances = newValue }
+    }
+
+    /// The licences to show, with Accept, before this run can go: the chosen offer's, and any the engine refused, that
+    /// this user hasn't accepted yet.
+    public var needsAcceptance: [License] {
+        var seen = Set<String>()
+        return ([form.pendingAcceptance].compactMap { $0 } + refusedTerms)
+            .filter { !acceptances.isAccepted($0) && seen.insert($0.spdx).inserted }
+    }
+
+    /// Whether an engine's answer refuses the run for terms its user hasn't accepted (Base §10.3).
+    public static func refusesTerms(_ error: any Error) -> Bool {
+        if case .engine(let e, _, _)? = error as? MESClientError { return refusesTerms(e) }
+        return (error as? MESError).map(refusesTerms) ?? false
+    }
+
+    public static func refusesTerms(_ error: MESError) -> Bool {
+        error.code == MESErrorCode.policyUnmet.rawValue && error.reason == Policy.termsNotAcceptedReason
+    }
+
+    /// The licences a terms refusal is about: those the error names, else every one of this operation's offers' that
+    /// this user hasn't accepted.
+    func termsRefused(by error: MESError) -> [License] {
+        let unaccepted = form.licencesNeedingAcceptance.filter { !acceptances.isAccepted($0) }
+        let named = unaccepted.filter { error.message.contains($0.spdx) }
+        return named.isEmpty ? unaccepted : named
+    }
+
+    /// The run failed: a terms refusal is kept in `refusedTerms` and said as such; anything else is `otherwise`, or the
+    /// error's message and code.
+    func fail(_ error: MESError, otherwise: String? = nil) {
+        if Self.refusesTerms(error) {
+            refusedTerms = termsRefused(by: error)
+            let spdx = refusedTerms.map(\.spdx).joined(separator: ", ")
+            phase = .failed("Accept \(spdx.isEmpty ? "the model's terms" : "the terms of \(spdx)") to run this. The engine runs it only "
+                            + "for people who have accepted them (\(error.code), \(error.reason ?? "")).")
+        } else {
+            phase = .failed(otherwise ?? "\(error.message) (\(error.code))")
+        }
+    }
     /// The request as it would be sent, with media shown as placeholders (for "show request" views).
     public var draftRequest: JobRequest {
         var inputs: [String: RequestInput] = media.mapValues { items in
@@ -288,6 +375,8 @@ public final class RunSession: Identifiable {
             finishedAt = nil
             results = []
             preview = nil
+            framePreviews.reset()
+            refusedTerms = []
             streamed = nil
             received = []
         }
@@ -301,6 +390,17 @@ public final class RunSession: Identifiable {
     }
 
     public func report(job: Job) { self.job = job }
+
+    /// The run failed with `error`: a terms refusal (422 `policy_unmet`, `terms_not_accepted`) is shown as needing
+    /// acceptance, with `refusedTerms`; anything else as the error.
+    public func report(failure error: any Error) {
+        switch error {
+        case MESClientError.engine(let e, _, _): fail(e, otherwise: "\(error)")
+        case let e as MESError: fail(e)
+        default: phase = .failed("\(error)")
+        }
+        if !phase.isActive { finishedAt = Date(); endStreams() }
+    }
     public func report(preview: Data) { self.preview = preview }
     public func report(results: [RunResult]) { self.results = results }
 
@@ -356,6 +456,8 @@ public final class RunSession: Identifiable {
         released = false
         results = []
         preview = nil
+        framePreviews.reset()
+        refusedTerms = []
         streamed = nil
         received = []
         do {
@@ -403,7 +505,7 @@ public final class RunSession: Identifiable {
             case .cancelled?:
                 phase = .cancelled
             case .failed?:
-                phase = .failed(final.error.map { "\($0.message) (\($0.code))" } ?? "The job failed.")
+                if let error = final.error { fail(error) } else { phase = .failed("The job failed.") }
             case .expired?:
                 phase = .failed("The outputs expired before they were collected.")
             default:
@@ -411,6 +513,8 @@ public final class RunSession: Identifiable {
             }
         } catch is CancellationError {
             phase = .cancelled
+        } catch let error as MESClientError where !Task.isCancelled && Self.refusesTerms(error) {
+            report(failure: error)
         } catch {
             phase = Task.isCancelled ? .cancelled : .failed("\(error)")
         }
@@ -449,6 +553,7 @@ public final class RunSession: Identifiable {
             }
         case .preview:
             if let base64 = event.data["data"]?.stringValue, let data = Data(base64Encoded: base64) { preview = data }
+            framePreviews.ingest(event)                              // a still of a video, with its moment
         case .warning:
             if let warning = try? event.data.decode(as: Warning.self), var current = job, !current.warnings.contains(warning) {
                 current.warnings.append(warning)
